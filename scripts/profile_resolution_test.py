@@ -2,28 +2,27 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-src = ROOT / "src"
-if str(src) not in sys.path:
-    sys.path.insert(0, str(src))
+from datetime import datetime, timedelta, timezone
 
 from trading_engine.data.binance import BinanceConfig, BinancePublicData
+from trading_engine.data.dataset import load_aligned_binance_dataset
 from trading_engine.volume_profile.trade_profile import build_trade_volume_profile
 
 
 def main() -> None:
-    config = BinanceConfig(symbol="BTCUSDT", interval="1m", limit=61)
-    provider = BinancePublicData(config)
-    bars = provider.fetch_klines()
-    trades = provider.fetch_agg_trades(start_time=bars.index[0], end_time=bars.index[-1])
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - timedelta(minutes=60)
+    provider = BinancePublicData(BinanceConfig(symbol="BTCUSDT"))
+    dataset = load_aligned_binance_dataset(
+        provider, interval="1m", start=start, end=end, bar_limit=1000
+    )
+    trades = dataset.trades
 
     resolutions = (10, 25, 50, 100)
     profiles = {}
     print("=== BTCUSDT PROFILE RESOLUTION TEST ===")
-    print(f"window={bars.index[0]} -> {bars.index[-1]}")
+    print(f"window={dataset.start} -> {dataset.end}")
+    print(f"bars={len(dataset.bars)}")
     print(f"trades={len(trades)}")
     print()
     print("resolution  bin_size  POC       VAH       VAL       HVNs  LVNs")
@@ -52,29 +51,32 @@ def main() -> None:
         print("  HVN:", ", ".join(f"{n.center:.2f}" for n in profile.hvn_nodes) or "none")
         print("  LVN:", ", ".join(f"{n.center:.2f}" for n in profile.lvn_nodes) or "none")
 
-    print("\n=== PERSISTENT HVN CENTERS ===")
-    hvn_centers = []
-    for profile in profiles.values():
-        hvn_centers.extend(n.center for n in profile.hvn_nodes)
-    for center in sorted(set(round(x, 2) for x in hvn_centers)):
-        count = sum(
-            any(abs(n.center - center) <= max(0.5, ticks * 0.01 * 1.5) for n in profile.hvn_nodes)
+    def persistent(node_type: str) -> None:
+        print(f"\n=== PERSISTENT {node_type} CENTERS ===")
+        all_nodes = [
+            (ticks, node)
             for ticks, profile in profiles.items()
-        )
-        if count >= 2:
-            print(f"center≈{center:.2f}, resolutions={count}/{len(profiles)}")
+            for node in (profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes)
+        ]
+        for ticks, node in all_nodes:
+            count = sum(
+                any(
+                    abs(other.center - node.center)
+                    <= max(0.5, max(ticks, other_ticks) * 0.01 * 1.5)
+                    for other in (
+                        other_profile.hvn_nodes
+                        if node_type == "HVN"
+                        else other_profile.lvn_nodes
+                    )
+                )
+                for other_ticks, other_profile in profiles.items()
+                if other_ticks != ticks
+            ) + 1
+            if count >= 2:
+                print(f"center≈{node.center:.2f}, resolutions={count}/{len(profiles)}")
 
-    print("\n=== PERSISTENT LVN CENTERS ===")
-    lvn_centers = []
-    for profile in profiles.values():
-        lvn_centers.extend(n.center for n in profile.lvn_nodes)
-    for center in sorted(set(round(x, 2) for x in lvn_centers)):
-        count = sum(
-            any(abs(n.center - center) <= max(0.5, ticks * 0.01 * 1.5) for n in profile.lvn_nodes)
-            for ticks, profile in profiles.items()
-        )
-        if count >= 2:
-            print(f"center≈{center:.2f}, resolutions={count}/{len(profiles)}")
+    persistent("HVN")
+    persistent("LVN")
 
 
 if __name__ == "__main__":

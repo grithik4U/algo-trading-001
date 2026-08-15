@@ -1,0 +1,1 @@
+Liquidity engine notes: the canonical implementation is currently under active Phase 1 development. Scope labels are provisional research definitions and must be validated before use in a trading signal.

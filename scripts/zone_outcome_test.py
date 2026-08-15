@@ -50,16 +50,13 @@ def _classify(event: str, direction: str | None, entry: float, future: pd.DataFr
 
     highs = future["high"].astype(float)
     lows = future["low"].astype(float)
-
     up_move = max(0.0, float(highs.max() - entry))
     down_move = max(0.0, float(entry - lows.min()))
 
     if direction == "UP":
-        favorable = up_move
-        adverse = down_move
+        favorable, adverse = up_move, down_move
     elif direction == "DOWN":
-        favorable = down_move
-        adverse = up_move
+        favorable, adverse = down_move, up_move
     else:
         return "UNDEFINED_DIRECTION", up_move, down_move
 
@@ -69,7 +66,6 @@ def _classify(event: str, direction: str | None, entry: float, future: pd.DataFr
         label = "ADVERSE"
     else:
         label = "MIXED"
-
     return label, favorable, adverse
 
 
@@ -96,26 +92,27 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
             last_event_bar[zone.zone_id] = bar_index
 
             close = float(row["close"])
-            if event_name in {"BREAKOUT", "RETEST"}:
+            # A BREAKOUT creates broken_direction during this bar. A RETEST
+            # clears it, so RETEST must use the direction captured beforehand.
+            if event_name == "BREAKOUT":
+                direction = _normalize_direction(event_name, zone.broken_direction)
+            elif event_name == "RETEST":
                 direction = _normalize_direction(event_name, previous_direction)
-            elif event_name in {"SWEEP", "REJECTION"}:
-                direction = "UP" if close >= zone.center else "DOWN"
             else:
-                direction = None
+                direction = "UP" if close >= zone.center else "DOWN"
 
             forward: dict[int, dict[str, float | str]] = {}
             for horizon in HORIZONS:
                 future = bars.iloc[bar_index + 1 : bar_index + 1 + horizon]
                 if future.empty:
                     continue
-                label, favorable, adverse = _classify(
-                    event_name, direction, close, future
-                )
+                label, favorable, adverse = _classify(event_name, direction, close, future)
                 last_close = float(future["close"].iloc[-1])
                 signed_move = last_close - close
                 directional_move = (
-                    signed_move if direction == "UP" else -signed_move
-                    if direction == "DOWN" else 0.0
+                    signed_move if direction == "UP"
+                    else -signed_move if direction == "DOWN"
+                    else 0.0
                 )
                 forward[horizon] = {
                     "close": last_close,
@@ -126,19 +123,17 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
                     "outcome": label,
                 }
 
-            events.append(
-                Outcome(
-                    timestamp=timestamp,
-                    node_type=zone.node_type,
-                    low=zone.low,
-                    high=zone.high,
-                    center=zone.center,
-                    event=event_name,
-                    direction=direction,
-                    entry=close,
-                    forward=forward,
-                )
-            )
+            events.append(Outcome(
+                timestamp=timestamp,
+                node_type=zone.node_type,
+                low=zone.low,
+                high=zone.high,
+                center=zone.center,
+                event=event_name,
+                direction=direction,
+                entry=close,
+                forward=forward,
+            ))
 
     return events
 
@@ -147,7 +142,6 @@ def _print_event_table(events: list[Outcome]) -> None:
     print("\n=== RECENT ZONE OUTCOMES ===")
     print("time | type | zone | event | dir | entry | 15m move | dir move | 15m MFE | 15m MAE | outcome")
     print("-----|------|------|-------|-----|-------|----------|----------|----------|----------|--------")
-
     for event in events[-25:][::-1]:
         result = event.forward.get(15)
         if not result:
@@ -165,14 +159,13 @@ def _print_summary(events: list[Outcome]) -> None:
     print("\n=== OUTCOME SUMMARY ===")
     print("event | n | favorable | mixed | adverse | avg dir move")
     print("------|---|-----------|-------|---------|-------------")
-
     for event_name in MEASURED_EVENTS:
         rows = [e.forward[15] for e in events if e.event == event_name and 15 in e.forward]
         if not rows:
             print(f"{event_name:<11} |   0 |       0.0% |   0.0% |     0.0% |        +0.00")
             continue
-        counts = {key: sum(1 for r in rows if r["outcome"] == key) for key in
-                  ("FAVORABLE", "MIXED", "ADVERSE")}
+        counts = {key: sum(1 for r in rows if r["outcome"] == key)
+                  for key in ("FAVORABLE", "MIXED", "ADVERSE")}
         n = len(rows)
         avg_directional_move = sum(float(r["directional_move"]) for r in rows) / n
         print(
@@ -236,7 +229,8 @@ def main() -> None:
     _print_summary(events)
 
     print("\nOutcome rules:")
-    print("- BREAKOUT and RETEST direction follows the confirmed breakout side.")
+    print("- BREAKOUT direction is taken from the newly confirmed close outside the zone.")
+    print("- RETEST direction follows the breakout side that caused the retest.")
     print("- SWEEP/REJECTION direction is inferred from close versus zone center.")
     print("- Directional move is positive when price moves in the event direction.")
     print("- FAVORABLE means MFE materially exceeded MAE; ADVERSE means the reverse; otherwise MIXED.")

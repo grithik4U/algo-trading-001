@@ -15,15 +15,11 @@ import pandas as pd
 from trading_engine.data.binance import BinanceConfig, BinancePublicData
 from trading_engine.data.dataset import load_aligned_binance_dataset
 
-from zone_interaction_test import (
-    ZoneState,
-    _build_profiles,
-    _build_zones,
-    _process_bar,
-)
+from zone_interaction_test import ZoneState, _build_profiles, _build_zones, _process_bar
 
 HORIZONS = (5, 15, 30, 60)
 MIN_EVENT_GAP_BARS = 2
+MEASURED_EVENTS = ("BREAKOUT", "RETEST", "SWEEP", "REJECTION")
 
 
 @dataclass
@@ -39,32 +35,24 @@ class Outcome:
     forward: dict[int, dict[str, float | str]]
 
 
-def _direction_for_event(zone: ZoneState, event: str, close: float) -> str | None:
-    if event == "BREAKOUT":
-        return zone.broken_direction
-    if event == "RETEST":
-        return zone.broken_direction
-    if event in {"REJECTION", "SWEEP"}:
-        if close > zone.center:
+def _normalize_direction(event: str, direction: str | None) -> str | None:
+    if event in {"BREAKOUT", "RETEST"}:
+        if direction == "ABOVE":
             return "UP"
-        if close < zone.center:
+        if direction == "BELOW":
             return "DOWN"
-    if event == "ACCEPTANCE":
-        return None
-    return None
+    return direction if direction in {"UP", "DOWN"} else None
 
 
-def _classify(event: str, direction: str | None, entry: float, zone: ZoneState,
-              future: pd.DataFrame) -> tuple[str, float, float]:
+def _classify(event: str, direction: str | None, entry: float, future: pd.DataFrame) -> tuple[str, float, float]:
     if future.empty:
         return "NO_DATA", 0.0, 0.0
 
     highs = future["high"].astype(float)
     lows = future["low"].astype(float)
-    closes = future["close"].astype(float)
 
-    up_move = float(highs.max() - entry)
-    down_move = float(entry - lows.min())
+    up_move = max(0.0, float(highs.max() - entry))
+    down_move = max(0.0, float(entry - lows.min()))
 
     if direction == "UP":
         favorable = up_move
@@ -73,28 +61,14 @@ def _classify(event: str, direction: str | None, entry: float, zone: ZoneState,
         favorable = down_move
         adverse = up_move
     else:
-        # For acceptance, measure whether price remains in/returns to the zone.
-        favorable = max(0.0, float(zone.high - closes.iloc[-1]))
-        adverse = max(0.0, float(closes.iloc[-1] - zone.high))
+        return "UNDEFINED_DIRECTION", up_move, down_move
 
-    if event == "BREAKOUT" and direction in {"ABOVE", "BELOW"}:
-        direction = "UP" if direction == "ABOVE" else "DOWN"
-
-    if direction in {"UP", "DOWN"}:
-        if favorable >= adverse * 1.25 and favorable >= 2.0:
-            label = "FAVORABLE"
-        elif adverse >= favorable * 1.25 and adverse >= 2.0:
-            label = "ADVERSE"
-        else:
-            label = "MIXED"
+    if favorable >= adverse * 1.25 and favorable >= 2.0:
+        label = "FAVORABLE"
+    elif adverse >= favorable * 1.25 and adverse >= 2.0:
+        label = "ADVERSE"
     else:
-        final_close = float(closes.iloc[-1])
-        if zone.low <= final_close <= zone.high:
-            label = "HELD_ZONE"
-        elif abs(final_close - zone.center) <= 3.0:
-            label = "NEAR_ZONE"
-        else:
-            label = "LEFT_ZONE"
+        label = "MIXED"
 
     return label, favorable, adverse
 
@@ -113,7 +87,7 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
                 continue
 
             event_name = zone.events[-1].rsplit(":", 1)[-1]
-            if event_name not in {"ACCEPTANCE", "SWEEP", "REJECTION", "BREAKOUT", "RETEST"}:
+            if event_name not in MEASURED_EVENTS:
                 continue
 
             previous_bar = last_event_bar.get(zone.zone_id)
@@ -122,9 +96,8 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
             last_event_bar[zone.zone_id] = bar_index
 
             close = float(row["close"])
-            direction = previous_direction
-            if event_name == "BREAKOUT":
-                direction = zone.broken_direction
+            if event_name in {"BREAKOUT", "RETEST"}:
+                direction = _normalize_direction(event_name, previous_direction)
             elif event_name in {"SWEEP", "REJECTION"}:
                 direction = "UP" if close >= zone.center else "DOWN"
             else:
@@ -136,12 +109,18 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
                 if future.empty:
                     continue
                 label, favorable, adverse = _classify(
-                    event_name, direction, close, zone, future
+                    event_name, direction, close, future
                 )
                 last_close = float(future["close"].iloc[-1])
+                signed_move = last_close - close
+                directional_move = (
+                    signed_move if direction == "UP" else -signed_move
+                    if direction == "DOWN" else 0.0
+                )
                 forward[horizon] = {
                     "close": last_close,
-                    "move": last_close - close,
+                    "move": signed_move,
+                    "directional_move": directional_move,
                     "mfe": favorable,
                     "mae": adverse,
                     "outcome": label,
@@ -166,8 +145,8 @@ def _collect_outcomes(dataset, states: list[ZoneState]) -> list[Outcome]:
 
 def _print_event_table(events: list[Outcome]) -> None:
     print("\n=== RECENT ZONE OUTCOMES ===")
-    print("time | type | zone | event | dir | entry | 15m move | 15m MFE | 15m MAE | outcome")
-    print("-----|------|------|-------|-----|-------|----------|----------|----------|--------")
+    print("time | type | zone | event | dir | entry | 15m move | dir move | 15m MFE | 15m MAE | outcome")
+    print("-----|------|------|-------|-----|-------|----------|----------|----------|----------|--------")
 
     for event in events[-25:][::-1]:
         result = event.forward.get(15)
@@ -177,44 +156,45 @@ def _print_event_table(events: list[Outcome]) -> None:
             f"{event.timestamp.strftime('%H:%M')} | {event.node_type:<3} | "
             f"{event.low:.2f}->{event.high:.2f} | {event.event:<11} | "
             f"{str(event.direction or '-'):>4} | {event.entry:>7.2f} | "
-            f"{float(result['move']):>+8.2f} | {float(result['mfe']):>8.2f} | "
-            f"{float(result['mae']):>8.2f} | {result['outcome']}"
+            f"{float(result['move']):>+8.2f} | {float(result['directional_move']):>+8.2f} | "
+            f"{float(result['mfe']):>8.2f} | {float(result['mae']):>8.2f} | {result['outcome']}"
         )
 
 
 def _print_summary(events: list[Outcome]) -> None:
     print("\n=== OUTCOME SUMMARY ===")
-    print("event | n | favorable | mixed | adverse | no_data")
-    print("------|---|-----------|-------|---------|--------")
+    print("event | n | favorable | mixed | adverse | avg dir move")
+    print("------|---|-----------|-------|---------|-------------")
 
-    for event_name in ("BREAKOUT", "RETEST", "SWEEP", "REJECTION", "ACCEPTANCE"):
+    for event_name in MEASURED_EVENTS:
         rows = [e.forward[15] for e in events if e.event == event_name and 15 in e.forward]
         if not rows:
-            print(f"{event_name:<11} |   0 |       0.0% |   0.0% |     0.0% |    0.0%")
+            print(f"{event_name:<11} |   0 |       0.0% |   0.0% |     0.0% |        +0.00")
             continue
         counts = {key: sum(1 for r in rows if r["outcome"] == key) for key in
-                  ("FAVORABLE", "MIXED", "ADVERSE", "NO_DATA")}
+                  ("FAVORABLE", "MIXED", "ADVERSE")}
         n = len(rows)
+        avg_directional_move = sum(float(r["directional_move"]) for r in rows) / n
         print(
             f"{event_name:<11} | {n:>2} | {counts['FAVORABLE']/n*100:>9.1f}% | "
             f"{counts['MIXED']/n*100:>5.1f}% | {counts['ADVERSE']/n*100:>7.1f}% | "
-            f"{counts['NO_DATA']/n*100:>6.1f}%"
+            f"{avg_directional_move:>+11.2f}"
         )
 
     print("\n=== HORIZON CHECK ===")
-    print("event | horizon | n | avg move | avg MFE | avg MAE")
-    print("------|---------|---|----------|----------|--------")
-    for event_name in ("BREAKOUT", "RETEST", "SWEEP", "REJECTION", "ACCEPTANCE"):
+    print("event | horizon | n | avg dir move | avg MFE | avg MAE")
+    print("------|---------|---|--------------|----------|--------")
+    for event_name in MEASURED_EVENTS:
         for horizon in HORIZONS:
             rows = [e.forward[horizon] for e in events if e.event == event_name and horizon in e.forward]
             if not rows:
                 continue
-            avg_move = sum(float(r["move"]) for r in rows) / len(rows)
+            avg_move = sum(float(r["directional_move"]) for r in rows) / len(rows)
             avg_mfe = sum(float(r["mfe"]) for r in rows) / len(rows)
             avg_mae = sum(float(r["mae"]) for r in rows) / len(rows)
             print(
                 f"{event_name:<11} | {horizon:>7}m | {len(rows):>2} | "
-                f"{avg_move:>+8.2f} | {avg_mfe:>8.2f} | {avg_mae:>7.2f}"
+                f"{avg_move:>+12.2f} | {avg_mfe:>8.2f} | {avg_mae:>7.2f}"
             )
 
 
@@ -256,10 +236,11 @@ def main() -> None:
     _print_summary(events)
 
     print("\nOutcome rules:")
-    print("- BREAKOUT direction is taken from the side of the confirmed close outside the zone.")
-    print("- SWEEP/REJECTION direction is inferred from the close relative to the zone center.")
+    print("- BREAKOUT and RETEST direction follows the confirmed breakout side.")
+    print("- SWEEP/REJECTION direction is inferred from close versus zone center.")
+    print("- Directional move is positive when price moves in the event direction.")
     print("- FAVORABLE means MFE materially exceeded MAE; ADVERSE means the reverse; otherwise MIXED.")
-    print("- Acceptance is direction-neutral and classified by whether price remains in/near the zone.")
+    print("- Acceptance is excluded from directional outcome scoring because it has no inherent direction.")
     print("- This script measures historical behavior only; it does not generate trade signals.")
 
 

@@ -15,6 +15,7 @@ NODE_MATCH_TOLERANCE = 1.25
 ZONE_GAP_TOLERANCE = 3.5
 MAX_ZONE_WIDTH = 10.0
 MIN_ZONE_COVERAGE = 0.30
+OVERLAP_EPSILON = 0.01
 
 
 def _cluster_nodes(nodes, tolerance: float = NODE_MATCH_TOLERANCE):
@@ -98,6 +99,87 @@ def _regime_label(total_windows: int, coverage: float, latest_match: int | None)
     return "LOW"
 
 
+def _score_zones(profiles, node_type: str):
+    """Build, persist, and score structural zones for one node type."""
+    total_windows = len(profiles)
+    all_nodes = []
+    for _, _, profile in profiles:
+        nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
+        all_nodes.extend(nodes)
+
+    clusters = _cluster_nodes(all_nodes)
+    zones = _consolidate_zones(clusters)
+    scored = []
+
+    for zone in zones:
+        matches = _zone_coverage(zone, profiles, node_type)
+        coverage = len(matches) / max(1, total_windows)
+        if coverage < MIN_ZONE_COVERAGE:
+            continue
+
+        latest_match = matches[-1] if matches else None
+        label = _regime_label(total_windows, coverage, latest_match)
+        recent_matches = sum(i >= max(0, total_windows - 4) for i in matches)
+        recent_ratio = recent_matches / min(4, total_windows)
+        relevance = (coverage * 0.6) + (recent_ratio * 0.4)
+        scored.append(
+            {
+                "type": node_type,
+                "low": zone["low"],
+                "high": zone["high"],
+                "center": zone["center"],
+                "coverage": coverage,
+                "relevance": relevance,
+                "windows": len(matches),
+                "status": label,
+                "nodes": sum(len(c["nodes"]) for c in zone["clusters"]),
+            }
+        )
+    return scored
+
+
+def _overlap(a, b):
+    """Return the price overlap between two zones, or None if they do not overlap."""
+    low = max(a["low"], b["low"])
+    high = min(a["high"], b["high"])
+    if high + OVERLAP_EPSILON < low:
+        return None
+    return low, high
+
+
+def _relationship(hvn, lvn):
+    """Classify how an HVN and LVN interact without deleting either structure."""
+    overlap = _overlap(hvn, lvn)
+    if overlap is None:
+        return None
+
+    overlap_low, overlap_high = overlap
+    hvn_inside = hvn["low"] >= lvn["low"] and hvn["high"] <= lvn["high"]
+    lvn_inside = lvn["low"] >= hvn["low"] and lvn["high"] <= hvn["high"]
+
+    if hvn_inside:
+        relation = "HVN_NESTED_IN_LVN"
+    elif lvn_inside:
+        relation = "LVN_NESTED_IN_HVN"
+    else:
+        relation = "OVERLAPPING"
+
+    # Preserve both structures and expose the stronger one for downstream prioritisation.
+    if hvn["relevance"] > lvn["relevance"]:
+        dominant = "HVN"
+    elif lvn["relevance"] > hvn["relevance"]:
+        dominant = "LVN"
+    else:
+        dominant = "TIE"
+
+    return {
+        "relation": relation,
+        "overlap_low": overlap_low,
+        "overlap_high": overlap_high,
+        "dominant": dominant,
+    }
+
+
 def main() -> None:
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - timedelta(hours=4)
@@ -141,58 +223,55 @@ def main() -> None:
             f"{len(profile.hvn_nodes):>4}  {len(profile.lvn_nodes):>4}"
         )
 
-    latest_window = profiles[-1][1] if profiles else None
-    total_windows = len(profiles)
+    hvn_zones = _score_zones(profiles, "HVN")
+    lvn_zones = _score_zones(profiles, "LVN")
 
-    for node_type in ("HVN", "LVN"):
-        all_nodes = []
-        for _, _, profile in profiles:
-            nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
-            all_nodes.extend(nodes)
-
-        clusters = _cluster_nodes(all_nodes)
-        zones = _consolidate_zones(clusters)
-        scored = []
-
-        for zone in zones:
-            matches = _zone_coverage(zone, profiles, node_type)
-            coverage = len(matches) / max(1, total_windows)
-            if coverage < MIN_ZONE_COVERAGE:
-                continue
-
-            latest_match = matches[-1] if matches else None
-            label = _regime_label(total_windows, coverage, latest_match)
-            recent_matches = sum(i >= max(0, total_windows - 4) for i in matches)
-            recent_ratio = recent_matches / min(4, total_windows)
-            relevance = (coverage * 0.6) + (recent_ratio * 0.4)
-            scored.append(
-                (
-                    relevance,
-                    coverage,
-                    zone["low"],
-                    zone["high"],
-                    zone["center"],
-                    len(matches),
-                    label,
-                    sum(len(c["nodes"]) for c in zone["clusters"]),
-                )
-            )
-
+    for node_type, zones in (("HVN", hvn_zones), ("LVN", lvn_zones)):
         print(f"\n=== TEMPORAL {node_type} STRUCTURAL ZONES ===")
         print("zone | center | windows | coverage | relevance | nodes | status")
-        for relevance, coverage, low, high, center, count, label, node_count in sorted(scored, reverse=True):
+        for zone in sorted(zones, key=lambda z: (z["relevance"], z["center"]), reverse=True):
             print(
-                f"{low:.2f} -> {high:.2f} | center≈{center:.2f} | "
-                f"windows={count}/{total_windows} | coverage={coverage:.0%} | "
-                f"relevance={relevance:.2f} | nodes={node_count} | {label}"
+                f"{zone['low']:.2f} -> {zone['high']:.2f} | center≈{zone['center']:.2f} | "
+                f"windows={zone['windows']}/{len(profiles)} | coverage={zone['coverage']:.0%} | "
+                f"relevance={zone['relevance']:.2f} | nodes={zone['nodes']} | {zone['status']}"
             )
 
+    print("\n=== HVN/LVN NESTED & OVERLAPPING RELATIONSHIPS ===")
+    print("HVN | LVN | overlap | relation | dominant")
+    relationships = []
+    for hvn in hvn_zones:
+        for lvn in lvn_zones:
+            relationship = _relationship(hvn, lvn)
+            if relationship is not None:
+                relationships.append((hvn, lvn, relationship))
+
+    if not relationships:
+        print("none")
+    else:
+        relationships.sort(key=lambda item: max(item[0]["relevance"], item[1]["relevance"]), reverse=True)
+        for hvn, lvn, relationship in relationships:
+            print(
+                f"{hvn['low']:.2f}->{hvn['high']:.2f} | "
+                f"{lvn['low']:.2f}->{lvn['high']:.2f} | "
+                f"{relationship['overlap_low']:.2f}->{relationship['overlap_high']:.2f} | "
+                f"{relationship['relation']} | {relationship['dominant']}"
+            )
+
+    latest_window = profiles[-1][1] if profiles else None
     if latest_window is not None:
         print(f"\nlatest_window_end={latest_window}")
-        print("Zone rules: nodes within $1.25 are matched; nearby structural clusters within $3.50 are "
-              "consolidated, with a maximum zone width of $10.00.")
-        print("Status definitions: HIGH_ACTIVE >=75% + recent; MEDIUM_ACTIVE >=50% + recent; "
-              "HISTORICAL >=50% but not recent; DEVELOPING >=30% + recent; LOW otherwise.")
+        print(
+            "Zone rules: nodes within $1.25 are matched; nearby structural clusters within $3.50 are "
+            "consolidated, with a maximum zone width of $10.00."
+        )
+        print(
+            "Relationship rules: overlapping HVN/LVN structures are preserved; nested zones are labeled "
+            "rather than deleted, and relevance determines the dominant structure."
+        )
+        print(
+            "Status definitions: HIGH_ACTIVE >=75% + recent; MEDIUM_ACTIVE >=50% + recent; "
+            "HISTORICAL >=50% but not recent; DEVELOPING >=30% + recent; LOW otherwise."
+        )
 
 
 if __name__ == "__main__":

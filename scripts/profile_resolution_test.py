@@ -10,7 +10,7 @@ from trading_engine.volume_profile.trade_profile import build_trade_volume_profi
 
 
 def _stable_zones(profiles, node_type: str):
-    """Cluster cross-resolution nodes without transitive chaining."""
+    """Cluster cross-resolution nodes and consolidate adjacent structural zones."""
     items = []
     for ticks, profile in profiles.items():
         nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
@@ -21,21 +21,20 @@ def _stable_zones(profiles, node_type: str):
     clusters = []
     for center, ticks, node in items:
         tolerance = max(0.5, ticks * 0.01 * 1.5)
-        target = None
-        for cluster in clusters:
-            if abs(center - cluster["anchor"]) <= max(tolerance, cluster["anchor_tolerance"]):
-                target = cluster
-                break
+        target = next(
+            (
+                cluster
+                for cluster in clusters
+                if abs(center - cluster["anchor"]) <= max(tolerance, cluster["anchor_tolerance"])
+            ),
+            None,
+        )
         if target is None:
-            target = {
-                "items": [],
-                "anchor": center,
-                "anchor_tolerance": tolerance,
-            }
+            target = {"items": [], "anchor": center, "anchor_tolerance": tolerance}
             clusters.append(target)
         target["items"].append((center, ticks, node))
 
-    stable = []
+    zones = []
     resolution_count = len(profiles)
     for cluster in clusters:
         by_resolution = {}
@@ -43,28 +42,55 @@ def _stable_zones(profiles, node_type: str):
             existing = by_resolution.get(ticks)
             if existing is None or node.prominence > existing.prominence:
                 by_resolution[ticks] = node
-        count = len(by_resolution)
-        if count < 2:
+        if len(by_resolution) < 2:
             continue
-        centers = [node.center for node in by_resolution.values()]
-        avg_center = sum(centers) / len(centers)
-        half_widths = [node.high - node.low for node in by_resolution.values()]
-        strengths = [node.prominence for node in by_resolution.values()]
-        stable.append({
-            "low": avg_center - max(half_widths) / 2,
-            "high": avg_center + max(half_widths) / 2,
-            "center": avg_center,
-            "resolutions": count,
-            "coverage": count / resolution_count,
-            "mean_prominence": sum(strengths) / len(strengths),
-            "max_prominence": max(strengths),
-        })
 
-    # Remove overlapping duplicate clusters, retaining the one with stronger
-    # cross-resolution coverage/prominence.
-    stable.sort(key=lambda z: (-z["coverage"], -z["mean_prominence"], z["center"]))
+        nodes = list(by_resolution.values())
+        weights = [max(node.prominence, 1e-9) for node in nodes]
+        center = sum(node.center * weight for node, weight in zip(nodes, weights)) / sum(weights)
+        zones.append(
+            {
+                "low": min(node.low for node in nodes),
+                "high": max(node.high for node in nodes),
+                "center": center,
+                "resolutions": len(nodes),
+                "coverage": len(nodes) / resolution_count,
+                "mean_prominence": sum(weights) / len(weights),
+                "max_prominence": max(weights),
+            }
+        )
+
+    # Consolidate overlapping or immediately adjacent representations of the
+    # same structural region. The maximum gap is one coarse profile bin.
+    zones.sort(key=lambda z: z["low"])
+    consolidated = []
+    for zone in zones:
+        if not consolidated:
+            consolidated.append(zone)
+            continue
+        previous = consolidated[-1]
+        gap = zone["low"] - previous["high"]
+        if gap <= 1.0:
+            total_weight = previous["mean_prominence"] + zone["mean_prominence"]
+            previous["low"] = min(previous["low"], zone["low"])
+            previous["high"] = max(previous["high"], zone["high"])
+            previous["center"] = (
+                previous["center"] * previous["mean_prominence"]
+                + zone["center"] * zone["mean_prominence"]
+            ) / total_weight
+            previous["resolutions"] = min(
+                resolution_count,
+                max(previous["resolutions"], zone["resolutions"]),
+            )
+            previous["coverage"] = previous["resolutions"] / resolution_count
+            previous["mean_prominence"] = max(previous["mean_prominence"], zone["mean_prominence"])
+            previous["max_prominence"] = max(previous["max_prominence"], zone["max_prominence"])
+        else:
+            consolidated.append(zone)
+
+    consolidated.sort(key=lambda z: (-z["coverage"], -z["mean_prominence"], z["center"]))
     selected = []
-    for zone in stable:
+    for zone in consolidated:
         if any(zone["low"] <= other["high"] and zone["high"] >= other["low"] for other in selected):
             continue
         selected.append(zone)

@@ -59,16 +59,7 @@ def _value_area(total: pd.Series, value_area_pct: float) -> tuple[float, float]:
     return float(levels.index[left]), float(levels.index[right])
 
 
-def _structural_nodes(
-    total: pd.Series,
-    delta: pd.Series,
-    *,
-    bin_size: float,
-    smoothing_bins: int,
-    prominence: float,
-    min_separation_bins: int,
-    min_relative_volume: float,
-) -> tuple[tuple[VolumeNode, ...], tuple[VolumeNode, ...]]:
+def _structural_nodes(total: pd.Series, delta: pd.Series, *, bin_size: float, smoothing_bins: int, prominence: float, min_separation_bins: int, min_relative_volume: float) -> tuple[tuple[VolumeNode, ...], tuple[VolumeNode, ...]]:
     if len(total) < 3:
         return (), ()
     profile = total.sort_index()
@@ -79,7 +70,6 @@ def _structural_nodes(
     radius = max(1, smoothing_bins // 2)
     mean_volume = float(profile.mean())
     candidates: dict[str, list[tuple[int, float]]] = {"HVN": [], "LVN": []}
-
     for i in range(1, len(values) - 1):
         lo, hi = max(0, i - radius), min(len(values), i + radius + 1)
         neighborhood = np.concatenate((values[lo:i], values[i + 1:hi]))
@@ -104,32 +94,12 @@ def _structural_nodes(
         for idx, strength in sorted(selected):
             center = float(profile.index[idx])
             half_width = bin_size / 2.0
-            nodes.append(VolumeNode(
-                low=center - half_width,
-                high=center + half_width,
-                center=center,
-                volume=float(raw[idx]),
-                relative_volume=float(raw[idx] / mean_volume) if mean_volume else 0.0,
-                delta=float(delta_values[idx]),
-                prominence=float(strength),
-                node_type=kind,
-            ))
+            nodes.append(VolumeNode(low=center - half_width, high=center + half_width, center=center, volume=float(raw[idx]), relative_volume=float(raw[idx] / mean_volume) if mean_volume else 0.0, delta=float(delta_values[idx]), prominence=float(strength), node_type=kind))
         return tuple(nodes)
-
     return select("HVN"), select("LVN")
 
 
-def build_trade_volume_profile(
-    trades: pd.DataFrame,
-    *,
-    tick_size: float,
-    value_area_pct: float = 0.70,
-    profile_bin_ticks: int = 10,
-    node_smoothing_bins: int = 3,
-    node_prominence: float = 0.25,
-    node_min_separation_bins: int = 3,
-    node_min_relative_volume: float = 1.0,
-) -> VolumeProfile:
+def build_trade_volume_profile(trades: pd.DataFrame, *, tick_size: float, value_area_pct: float = 0.70, profile_bin_ticks: int = 10, node_smoothing_bins: int = 3, node_prominence: float = 0.25, node_min_separation_bins: int = 3, node_min_relative_volume: float = 1.0) -> VolumeProfile:
     """Build a trade-level profile with resolution-aware structural nodes."""
     if trades.empty:
         return _empty_profile()
@@ -151,24 +121,25 @@ def build_trade_volume_profile(
         return _empty_profile()
 
     ticks = np.rint(frame["price"].to_numpy(dtype=float) / tick_size).astype(np.int64)
-    frame["profile_tick"] = (ticks // profile_bin_ticks) * profile_bin_ticks
+    profile_ticks = ticks // profile_bin_ticks
+    frame["profile_bin"] = profile_ticks
     frame["buy_volume"] = np.where(~frame["buyer_maker"].astype(bool), frame["quantity"], 0.0)
     frame["sell_volume"] = np.where(frame["buyer_maker"].astype(bool), frame["quantity"], 0.0)
-    grouped = frame.groupby("profile_tick", sort=True)
-    buy_ticks = grouped["buy_volume"].sum()
-    sell_ticks = grouped["sell_volume"].sum()
-    total_ticks = buy_ticks + sell_ticks
-    delta_ticks = buy_ticks - sell_ticks
+    grouped = frame.groupby("profile_bin", sort=True)
+    buy_bins = grouped["buy_volume"].sum()
+    sell_bins = grouped["sell_volume"].sum()
+    total_bins = buy_bins + sell_bins
+    delta_bins = buy_bins - sell_bins
+
     scale = tick_size * profile_bin_ticks
-    index = pd.Index(total_ticks.index.to_numpy(dtype=np.int64) * scale, dtype=float)
-    buy = pd.Series(buy_ticks.to_numpy(dtype=float), index=index, name="buy_volume")
-    sell = pd.Series(sell_ticks.to_numpy(dtype=float), index=index, name="sell_volume")
-    total = pd.Series(total_ticks.to_numpy(dtype=float), index=index, name="volume")
-    delta = pd.Series(delta_ticks.to_numpy(dtype=float), index=index, name="delta")
+    index = pd.Index(total_bins.index.to_numpy(dtype=np.int64) * scale, dtype=float)
+    buy = pd.Series(buy_bins.to_numpy(dtype=float), index=index, name="buy_volume")
+    sell = pd.Series(sell_bins.to_numpy(dtype=float), index=index, name="sell_volume")
+    total = pd.Series(total_bins.to_numpy(dtype=float), index=index, name="volume")
+    delta = pd.Series(delta_bins.to_numpy(dtype=float), index=index, name="delta")
     poc = float(total.idxmax())
     val, vah = _value_area(total, value_area_pct)
-    bin_size = scale
-    hvn_nodes, lvn_nodes = _structural_nodes(total, delta, bin_size=bin_size, smoothing_bins=node_smoothing_bins, prominence=node_prominence, min_separation_bins=node_min_separation_bins, min_relative_volume=node_min_relative_volume)
+    hvn_nodes, lvn_nodes = _structural_nodes(total, delta, bin_size=scale, smoothing_bins=node_smoothing_bins, prominence=node_prominence, min_separation_bins=node_min_separation_bins, min_relative_volume=node_min_relative_volume)
     return VolumeProfile(total, buy, sell, delta, poc, vah, val, tuple(n.center for n in hvn_nodes), tuple(n.center for n in lvn_nodes), hvn_nodes, lvn_nodes)
 
 

@@ -9,6 +9,54 @@ from trading_engine.data.dataset import load_aligned_binance_dataset
 from trading_engine.volume_profile.trade_profile import build_trade_volume_profile
 
 
+def _stable_zones(profiles, node_type: str):
+    """Cluster nearby nodes so each structural zone is reported once."""
+    items = []
+    for ticks, profile in profiles.items():
+        nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
+        for node in nodes:
+            items.append((node.center, ticks, node))
+    items.sort(key=lambda item: item[0])
+
+    clusters = []
+    for center, ticks, node in items:
+        tolerance = max(0.5, ticks * 0.01 * 1.5)
+        target = None
+        for cluster in reversed(clusters):
+            if center - cluster["high"] <= max(tolerance, cluster["tolerance"]):
+                target = cluster
+                break
+        if target is None:
+            target = {"items": [], "low": center, "high": center, "tolerance": tolerance}
+            clusters.append(target)
+        target["items"].append((center, ticks, node))
+        target["low"] = min(target["low"], node.low)
+        target["high"] = max(target["high"], node.high)
+        target["tolerance"] = max(target["tolerance"], tolerance)
+
+    stable = []
+    resolution_count = len(profiles)
+    for cluster in clusters:
+        by_resolution = {}
+        for center, ticks, node in cluster["items"]:
+            by_resolution[ticks] = node
+        count = len(by_resolution)
+        if count >= 2:
+            centers = [node.center for node in by_resolution.values()]
+            avg_center = sum(centers) / len(centers)
+            strengths = [node.prominence for node in by_resolution.values()]
+            stable.append({
+                "low": cluster["low"],
+                "high": cluster["high"],
+                "center": avg_center,
+                "resolutions": count,
+                "coverage": count / resolution_count,
+                "mean_prominence": sum(strengths) / len(strengths),
+                "max_prominence": max(strengths),
+            })
+    return stable
+
+
 def main() -> None:
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - timedelta(minutes=60)
@@ -51,32 +99,18 @@ def main() -> None:
         print("  HVN:", ", ".join(f"{n.center:.2f}" for n in profile.hvn_nodes) or "none")
         print("  LVN:", ", ".join(f"{n.center:.2f}" for n in profile.lvn_nodes) or "none")
 
-    def persistent(node_type: str) -> None:
-        print(f"\n=== PERSISTENT {node_type} CENTERS ===")
-        all_nodes = [
-            (ticks, node)
-            for ticks, profile in profiles.items()
-            for node in (profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes)
-        ]
-        for ticks, node in all_nodes:
-            count = sum(
-                any(
-                    abs(other.center - node.center)
-                    <= max(0.5, max(ticks, other_ticks) * 0.01 * 1.5)
-                    for other in (
-                        other_profile.hvn_nodes
-                        if node_type == "HVN"
-                        else other_profile.lvn_nodes
-                    )
-                )
-                for other_ticks, other_profile in profiles.items()
-                if other_ticks != ticks
-            ) + 1
-            if count >= 2:
-                print(f"center≈{node.center:.2f}, resolutions={count}/{len(profiles)}")
-
-    persistent("HVN")
-    persistent("LVN")
+    for node_type in ("HVN", "LVN"):
+        print(f"\n=== STABLE {node_type} ZONES ===")
+        zones = _stable_zones(profiles, node_type)
+        zones.sort(key=lambda z: (-z["coverage"], -z["mean_prominence"], z["center"]))
+        for zone in zones:
+            strength = "HIGH" if zone["coverage"] == 1.0 else "MEDIUM"
+            print(
+                f"{zone['low']:.2f} -> {zone['high']:.2f} | "
+                f"center≈{zone['center']:.2f} | "
+                f"resolutions={zone['resolutions']}/{len(profiles)} | "
+                f"mean_prominence={zone['mean_prominence']:.2f} | {strength}"
+            )
 
 
 if __name__ == "__main__":

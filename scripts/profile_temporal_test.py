@@ -9,25 +9,61 @@ from trading_engine.data.dataset import load_aligned_binance_dataset
 from trading_engine.volume_profile.trade_profile import build_trade_volume_profile
 
 
-def _cluster_nodes(nodes, tolerance: float = 1.0):
+WINDOW_SIZE = timedelta(hours=1)
+STEP = timedelta(minutes=15)
+NODE_MATCH_TOLERANCE = 1.25
+MIN_ZONE_COVERAGE = 0.30
+
+
+def _cluster_nodes(nodes, tolerance: float = NODE_MATCH_TOLERANCE):
+    """Cluster nearby nodes without chaining distant nodes through a long bridge."""
     clusters = []
     for node in sorted(nodes, key=lambda n: n.center):
-        target = None
+        best = None
+        best_distance = float("inf")
         for cluster in clusters:
-            if abs(node.center - cluster["center"]) <= tolerance:
-                target = cluster
-                break
-        if target is None:
-            target = {"center": node.center, "nodes": []}
-            clusters.append(target)
-        target["nodes"].append(node)
-        target["center"] = sum(n.center for n in target["nodes"]) / len(target["nodes"])
+            distance = abs(node.center - cluster["center"])
+            if distance <= tolerance and distance < best_distance:
+                best = cluster
+                best_distance = distance
+        if best is None:
+            best = {"center": node.center, "nodes": []}
+            clusters.append(best)
+        best["nodes"].append(node)
+        # Robust center: median of observed node centers.
+        values = sorted(n.center for n in best["nodes"])
+        mid = len(values) // 2
+        best["center"] = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
     return clusters
+
+
+def _zone_coverage(center: float, profiles, node_type: str, tolerance: float = NODE_MATCH_TOLERANCE):
+    """Return the number of distinct windows containing a matching node."""
+    matched = []
+    for i, (_, _, profile) in enumerate(profiles):
+        nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
+        if any(abs(node.center - center) <= tolerance for node in nodes):
+            matched.append(i)
+    return matched
+
+
+def _regime_label(window_index: int, total_windows: int, coverage: float, latest_match: int | None) -> str:
+    """Classify a zone by persistence and whether it remains relevant near the latest window."""
+    recent_cutoff = max(0, total_windows - 4)
+    recent = latest_match is not None and latest_match >= recent_cutoff
+    if coverage >= 0.75 and recent:
+        return "HIGH_ACTIVE"
+    if coverage >= 0.50 and recent:
+        return "MEDIUM_ACTIVE"
+    if coverage >= 0.50:
+        return "HISTORICAL"
+    if coverage >= MIN_ZONE_COVERAGE and recent:
+        return "DEVELOPING"
+    return "LOW"
 
 
 def main() -> None:
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    # Fetch enough data for overlapping 60-minute profiles stepped every 15 minutes.
     start = end - timedelta(hours=4)
     provider = BinancePublicData(BinanceConfig(symbol="BTCUSDT"))
     dataset = load_aligned_binance_dataset(
@@ -35,15 +71,15 @@ def main() -> None:
     )
 
     windows = []
-    window_size = timedelta(hours=1)
-    step = timedelta(minutes=15)
     cursor = dataset.start
-    while cursor + window_size <= dataset.end:
-        window_end = cursor + window_size
-        trades = dataset.trades.loc[(dataset.trades.index >= cursor) & (dataset.trades.index < window_end)]
+    while cursor + WINDOW_SIZE <= dataset.end:
+        window_end = cursor + WINDOW_SIZE
+        trades = dataset.trades.loc[
+            (dataset.trades.index >= cursor) & (dataset.trades.index < window_end)
+        ]
         if len(trades) >= 100:
             windows.append((cursor, window_end, trades))
-        cursor += step
+        cursor += STEP
 
     profiles = []
     for window_start, window_end, trades in windows:
@@ -63,36 +99,47 @@ def main() -> None:
     print(f"windows={len(profiles)}")
     print("\nwindow_end            POC       VAH       VAL       HVNs  LVNs")
     print("--------------------  --------  --------  --------  ----  ----")
-    for window_start, window_end, profile in profiles:
+    for _, window_end, profile in profiles:
         print(
             f"{window_end.isoformat():<20}  {profile.poc:>8.2f}  {profile.vah:>8.2f}  {profile.val:>8.2f}  "
             f"{len(profile.hvn_nodes):>4}  {len(profile.lvn_nodes):>4}"
         )
+
+    latest_window = profiles[-1][1] if profiles else None
+    total_windows = len(profiles)
 
     for node_type in ("HVN", "LVN"):
         all_nodes = []
         for _, _, profile in profiles:
             nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
             all_nodes.extend(nodes)
-        clusters = _cluster_nodes(all_nodes, tolerance=1.0)
-        print(f"\n=== TEMPORALLY PERSISTENT {node_type} ZONES ===")
-        persistent = []
-        for cluster in clusters:
-            window_ids = set()
-            for i, (_, _, profile) in enumerate(profiles):
-                nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
-                if any(abs(node.center - cluster["center"]) <= 1.0 for node in nodes):
-                    window_ids.add(i)
-            coverage = len(window_ids) / max(1, len(profiles))
-            if len(window_ids) >= 2:
-                persistent.append((coverage, cluster["center"], len(window_ids)))
+        clusters = _cluster_nodes(all_nodes)
 
-        for coverage, center, count in sorted(persistent, reverse=True):
-            strength = "HIGH" if coverage >= 0.75 else "MEDIUM"
+        zones = []
+        for cluster in clusters:
+            matches = _zone_coverage(cluster["center"], profiles, node_type)
+            coverage = len(matches) / max(1, total_windows)
+            if coverage < MIN_ZONE_COVERAGE:
+                continue
+            latest_match = matches[-1] if matches else None
+            label = _regime_label(len(matches) - 1 if matches else 0, total_windows, coverage, latest_match)
+            # Current relevance is explicitly higher when the zone appears in recent windows.
+            recent_matches = sum(i >= max(0, total_windows - 4) for i in matches)
+            relevance = (coverage * 0.6) + ((recent_matches / min(4, total_windows)) * 0.4)
+            zones.append((relevance, coverage, cluster["center"], len(matches), label))
+
+        print(f"\n=== TEMPORAL {node_type} ZONES ===")
+        print("center≈price | windows | coverage | relevance | status")
+        for relevance, coverage, center, count, label in sorted(zones, reverse=True):
             print(
-                f"center≈{center:.2f} | windows={count}/{len(profiles)} | "
-                f"coverage={coverage:.0%} | {strength}"
+                f"center≈{center:.2f} | windows={count}/{total_windows} | "
+                f"coverage={coverage:.0%} | relevance={relevance:.2f} | {label}"
             )
+
+    if latest_window is not None:
+        print(f"\nlatest_window_end={latest_window}")
+        print("Status definitions: HIGH_ACTIVE >=75% + recent; MEDIUM_ACTIVE >=50% + recent; "
+              "HISTORICAL >=50% but not recent; DEVELOPING >=30% + recent; LOW otherwise.")
 
 
 if __name__ == "__main__":

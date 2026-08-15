@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 
-from trading_engine.data.binance import BinanceProvider
+from trading_engine.data.binance import BinanceConfig, BinancePublicData
 
 
 def main() -> None:
@@ -18,9 +18,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=1000)
     args = parser.parse_args()
 
-    provider = BinanceProvider()
-    bars = provider.get_bars(args.symbol, args.interval, limit=args.limit)
-    trades = provider.get_aggregate_trades(args.symbol, limit=min(args.limit, 1000))
+    provider = BinancePublicData(BinanceConfig(symbol=args.symbol))
+    bars = provider.get_klines(args.interval, limit=args.limit)
+    trades = provider.get_agg_trades(limit=min(args.limit, 1000))
 
     print(f"bars={len(bars)}")
     print(f"trades={len(trades)}")

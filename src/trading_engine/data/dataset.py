@@ -27,14 +27,8 @@ def load_aligned_binance_dataset(
     start: datetime,
     end: datetime,
     bar_limit: int = 1000,
-    trade_limit: int = 1000,
 ) -> MarketDataSet:
-    """Load bars and trades for the same requested UTC interval.
-
-    The provider may paginate/limit each endpoint independently. This function
-    validates the returned timestamps and refuses a dataset whose returned
-    range falls outside the requested interval.
-    """
+    """Load bars and all available aggregate trades for the same UTC window."""
     if start.tzinfo is None or end.tzinfo is None:
         raise ValueError("start and end must be timezone-aware")
     if end <= start:
@@ -43,7 +37,7 @@ def load_aligned_binance_dataset(
     start = start.astimezone(timezone.utc)
     end = end.astimezone(timezone.utc)
     bars = provider.get_klines(interval, start_time=start, end_time=end, limit=bar_limit)
-    trades = provider.get_agg_trades(start_time=start, end_time=end, limit=trade_limit)
+    trades = provider.get_agg_trades_window(start, end)
 
     for frame, name in ((bars, "bars"), (trades, "trades")):
         if not frame.empty:

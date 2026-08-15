@@ -10,7 +10,7 @@ from trading_engine.volume_profile.trade_profile import build_trade_volume_profi
 
 
 def _stable_zones(profiles, node_type: str):
-    """Cluster nearby nodes so each structural zone is reported once."""
+    """Cluster cross-resolution nodes without transitive chaining."""
     items = []
     for ticks, profile in profiles.items():
         nodes = profile.hvn_nodes if node_type == "HVN" else profile.lvn_nodes
@@ -22,39 +22,53 @@ def _stable_zones(profiles, node_type: str):
     for center, ticks, node in items:
         tolerance = max(0.5, ticks * 0.01 * 1.5)
         target = None
-        for cluster in reversed(clusters):
-            if center - cluster["high"] <= max(tolerance, cluster["tolerance"]):
+        for cluster in clusters:
+            if abs(center - cluster["anchor"]) <= max(tolerance, cluster["anchor_tolerance"]):
                 target = cluster
                 break
         if target is None:
-            target = {"items": [], "low": center, "high": center, "tolerance": tolerance}
+            target = {
+                "items": [],
+                "anchor": center,
+                "anchor_tolerance": tolerance,
+            }
             clusters.append(target)
         target["items"].append((center, ticks, node))
-        target["low"] = min(target["low"], node.low)
-        target["high"] = max(target["high"], node.high)
-        target["tolerance"] = max(target["tolerance"], tolerance)
 
     stable = []
     resolution_count = len(profiles)
     for cluster in clusters:
         by_resolution = {}
         for center, ticks, node in cluster["items"]:
-            by_resolution[ticks] = node
+            existing = by_resolution.get(ticks)
+            if existing is None or node.prominence > existing.prominence:
+                by_resolution[ticks] = node
         count = len(by_resolution)
-        if count >= 2:
-            centers = [node.center for node in by_resolution.values()]
-            avg_center = sum(centers) / len(centers)
-            strengths = [node.prominence for node in by_resolution.values()]
-            stable.append({
-                "low": cluster["low"],
-                "high": cluster["high"],
-                "center": avg_center,
-                "resolutions": count,
-                "coverage": count / resolution_count,
-                "mean_prominence": sum(strengths) / len(strengths),
-                "max_prominence": max(strengths),
-            })
-    return stable
+        if count < 2:
+            continue
+        centers = [node.center for node in by_resolution.values()]
+        avg_center = sum(centers) / len(centers)
+        half_widths = [node.high - node.low for node in by_resolution.values()]
+        strengths = [node.prominence for node in by_resolution.values()]
+        stable.append({
+            "low": avg_center - max(half_widths) / 2,
+            "high": avg_center + max(half_widths) / 2,
+            "center": avg_center,
+            "resolutions": count,
+            "coverage": count / resolution_count,
+            "mean_prominence": sum(strengths) / len(strengths),
+            "max_prominence": max(strengths),
+        })
+
+    # Remove overlapping duplicate clusters, retaining the one with stronger
+    # cross-resolution coverage/prominence.
+    stable.sort(key=lambda z: (-z["coverage"], -z["mean_prominence"], z["center"]))
+    selected = []
+    for zone in stable:
+        if any(zone["low"] <= other["high"] and zone["high"] >= other["low"] for other in selected):
+            continue
+        selected.append(zone)
+    return sorted(selected, key=lambda z: z["center"])
 
 
 def main() -> None:
@@ -102,7 +116,6 @@ def main() -> None:
     for node_type in ("HVN", "LVN"):
         print(f"\n=== STABLE {node_type} ZONES ===")
         zones = _stable_zones(profiles, node_type)
-        zones.sort(key=lambda z: (-z["coverage"], -z["mean_prominence"], z["center"]))
         for zone in zones:
             strength = "HIGH" if zone["coverage"] == 1.0 else "MEDIUM"
             print(

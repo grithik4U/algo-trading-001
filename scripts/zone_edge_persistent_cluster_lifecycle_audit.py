@@ -37,6 +37,24 @@ def _assign_persistent_clusters(events,bars):
         c['last_seen']=event.timestamp; assigned[c['id']].append(event)
     return clusters,assigned
 
+def _independent_events(assigned,interaction_gap_minutes=5):
+    """Return the canonical independent-event subset used by lifecycle audits."""
+    selected=[]
+    for cid,items in assigned.items():
+        items=sorted(items,key=lambda e:e.timestamp); state='IDLE'; last_ts=None; last_breakout=None; seen_retest=False
+        for e in items:
+            typ=str(e.event).upper(); ts=e.timestamp
+            if state=='IDLE':
+                selected.append(e); state='BROKEN' if typ=='BREAKOUT' else 'IDLE'; last_ts=ts; last_breakout=ts if typ=='BREAKOUT' else None; seen_retest=False; continue
+            if typ=='RETEST' and last_breakout is not None and not seen_retest:
+                gap=(ts-last_breakout).total_seconds()/60
+                if 0<=gap<=RETEST_MAX_MINUTES:
+                    seen_retest=True; state='IDLE'; last_ts=ts; continue
+            if typ=='BREAKOUT' and last_ts is not None and (ts-last_ts).total_seconds()/60>=interaction_gap_minutes:
+                selected.append(e); state='BROKEN'; last_ts=ts; last_breakout=ts; seen_retest=False; continue
+            last_ts=ts
+    return sorted(selected,key=lambda e:e.timestamp)
+
 def _audit_lifecycles(assigned,interaction_gap_minutes=5):
     independent=suppressed=0; counts=Counter(); reasons=Counter(); examples=[]
     for cid,items in assigned.items():

@@ -8,7 +8,11 @@ Key guarantee:
     window_end is <= t. No future profile/node can influence the zone used for
     the event.
 
-The existing acceptance + independent-event lifecycle logic is preserved.
+Lifecycle rule:
+    A zone cannot become BROKEN merely because a new snapshot is created while
+    price is already outside it. Price must first interact with/touch the zone.
+    A post-touch move away is held as a rejection candidate until it either
+    resolves back into the zone (REJECTION) or establishes BREAKOUT.
 """
 from __future__ import annotations
 
@@ -83,6 +87,7 @@ class ZoneLifecycle:
     outside_up: int = 0
     outside_down: int = 0
     bars_since_touch: int | None = None
+    rejection_direction: str | None = None
     broken_direction: str | None = None
     cooldown: int = 0
     last_seen_snapshot: int = -1
@@ -206,6 +211,23 @@ def _find_walk_forward_events(bars, snapshots):
         if len(audit["samples"]) < AUDIT_SAMPLE_SIZE and old != new_state:
             audit["samples"].append((ts, state.zone_key, old, new_state, reason, state.center))
 
+    def emit(event, state, ts, direction, close):
+        events.append(
+            Event(
+                ts,
+                state.node_type,
+                state.low,
+                state.high,
+                state.center,
+                state.status,
+                event,
+                direction,
+                close,
+                state.zone_key,
+            )
+        )
+        audit["event_zone_counts"][state.zone_key] += 1
+
     for ts, row in bars.iterrows():
         snapshot_pointer, snapshot = _snapshot_for_timestamp(snapshots, ts, snapshot_pointer)
         if snapshot is not None and snapshot[2] != snapshot_id:
@@ -227,6 +249,7 @@ def _find_walk_forward_events(bars, snapshots):
         for state in states:
             if state.last_seen_snapshot != snapshot_id:
                 continue
+
             touched = _touches(state.low, state.high, bar_low, bar_high)
             inside = _inside(state.low, state.high, close)
             above = close > state.high
@@ -234,76 +257,102 @@ def _find_walk_forward_events(bars, snapshots):
 
             if state.cooldown:
                 state.cooldown -= 1
-                if touched:
-                    state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 continue
 
             if state.state == "BROKEN":
                 if touched:
-                    events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "RETEST", state.broken_direction, close, state.zone_key))
-                    audit["event_zone_counts"][state.zone_key] += 1
+                    emit("RETEST", state, ts, state.broken_direction, close)
                     transition(state, "COOLDOWN", ts, "retest")
                     state.cooldown = LIFECYCLE_COOLDOWN_BARS
                     state.broken_direction = None
                 continue
 
             if state.state == "COOLDOWN":
-                state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 continue
 
-            if above:
-                state.outside_up += 1
-                state.outside_down = 0
-            elif below:
-                state.outside_down += 1
-                state.outside_up = 0
-            else:
-                state.outside_up = state.outside_down = 0
-
-            if state.outside_up >= BREAKOUT_BARS or state.outside_down >= BREAKOUT_BARS:
-                direction = "UP" if state.outside_up >= BREAKOUT_BARS else "DOWN"
-                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "BREAKOUT", direction, close, state.zone_key))
-                audit["event_zone_counts"][state.zone_key] += 1
-                transition(state, "BROKEN", ts, f"breakout_{direction.lower()}")
-                state.broken_direction = direction
-                state.inside_streak = 0
-                state.bars_since_touch = None
+            # A newly discovered zone cannot be declared broken just because
+            # price is already outside it. It must first interact with the zone.
+            if state.state == "IDLE":
+                if touched:
+                    state.bars_since_touch = 0
+                    state.inside_streak = 1 if inside else 0
+                    if inside and state.inside_streak >= ACCEPTANCE_BARS:
+                        acceptances.append(Acceptance(ts, state.node_type, state.low, state.high, state.center, state.status, close, state.zone_key))
+                        transition(state, "ACCEPTED", ts, "acceptance_confirmed")
+                    else:
+                        transition(state, "TOUCHED", ts, "touch")
                 continue
 
+            # Existing interaction lifecycle.
             if touched:
                 state.bars_since_touch = 0
                 if inside:
+                    state.outside_up = 0
+                    state.outside_down = 0
+                    state.rejection_direction = None
                     state.inside_streak += 1
-                    if state.inside_streak >= ACCEPTANCE_BARS and state.state != "ACCEPTED":
+                    if state.state == "TOUCHED" and state.inside_streak >= ACCEPTANCE_BARS:
                         acceptances.append(Acceptance(ts, state.node_type, state.low, state.high, state.center, state.status, close, state.zone_key))
                         transition(state, "ACCEPTED", ts, "acceptance_confirmed")
                 else:
                     state.inside_streak = 0
-                    if state.state == "IDLE":
-                        transition(state, "TOUCHED", ts, "touch")
+                    state.rejection_direction = "UP" if above else "DOWN" if below else None
                 continue
 
             if state.bars_since_touch is not None:
                 state.bars_since_touch += 1
 
-            if state.state in {"IDLE", "TOUCHED"} and state.bars_since_touch is not None and state.bars_since_touch <= MAX_REJECTION_BARS and (above or below):
-                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "REJECTION", _direction("REJECTION", close, state.low, state.high), close, state.zone_key))
-                audit["event_zone_counts"][state.zone_key] += 1
-                transition(state, "COOLDOWN", ts, "rejection")
-                state.cooldown = LIFECYCLE_COOLDOWN_BARS
-                state.bars_since_touch = None
-                continue
+            # Only a previously touched/accepted zone can establish breakout.
+            if state.state in {"TOUCHED", "ACCEPTED"}:
+                if above:
+                    state.outside_up += 1
+                    state.outside_down = 0
+                    state.rejection_direction = "UP"
+                elif below:
+                    state.outside_down += 1
+                    state.outside_up = 0
+                    state.rejection_direction = "DOWN"
+                else:
+                    state.outside_up = 0
+                    state.outside_down = 0
+
+                if state.outside_up >= BREAKOUT_BARS or state.outside_down >= BREAKOUT_BARS:
+                    direction = "UP" if state.outside_up >= BREAKOUT_BARS else "DOWN"
+                    emit("BREAKOUT", state, ts, direction, close)
+                    transition(state, "BROKEN", ts, f"breakout_{direction.lower()}")
+                    state.broken_direction = direction
+                    state.inside_streak = 0
+                    state.bars_since_touch = None
+                    state.rejection_direction = None
+                    state.outside_up = 0
+                    state.outside_down = 0
+                    continue
+
+                # If price leaves the zone but does not establish a breakout,
+                # wait for a return inside the zone. That resolves as rejection.
+                if state.rejection_direction and state.bars_since_touch <= MAX_REJECTION_BARS and state.outside_up + state.outside_down > 0:
+                    # Keep the candidate pending until it either re-enters or
+                    # establishes BREAKOUT. This avoids classifying a breakout
+                    # as a rejection prematurely.
+                    continue
+
+                if state.bars_since_touch is not None and state.bars_since_touch > MAX_REJECTION_BARS:
+                    emit("REJECTION", state, ts, state.rejection_direction, close)
+                    transition(state, "COOLDOWN", ts, "rejection_window_expired")
+                    state.cooldown = LIFECYCLE_COOLDOWN_BARS
+                    state.bars_since_touch = None
+                    state.rejection_direction = None
+                    state.outside_up = 0
+                    state.outside_down = 0
+                    continue
 
             if state.state == "ACCEPTED" and (above or below):
+                # The breakout branch above normally resolves this first. This
+                # fallback simply closes acceptance if the zone definition moved.
                 transition(state, "COOLDOWN", ts, "acceptance_resolved_outside")
                 state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 state.bars_since_touch = None
-                continue
-
-            if state.bars_since_touch is not None and state.bars_since_touch > MAX_REJECTION_BARS:
-                transition(state, "COOLDOWN", ts, "rejection_window_expired")
-                state.cooldown = LIFECYCLE_COOLDOWN_BARS
-                state.bars_since_touch = None
+                state.rejection_direction = None
 
     return sorted(events, key=lambda e: e.timestamp), sorted(acceptances, key=lambda a: a.timestamp), audit
 
@@ -339,7 +388,7 @@ def _print_audit(bars, snapshots, events, acceptances, audit):
     print("zone_event_frequency_top10:")
     for key, count in audit["event_zone_counts"].most_common(10):
         print(f"  {key} | events={count}")
-    print("audit_note=high event density or repeated events on one zone requires lifecycle review before 30d validation")
+    print("audit_note=event counts should be reviewed for lifecycle independence before 30d validation")
 
 
 def main():
@@ -384,7 +433,7 @@ def main():
             avg_base = np.mean([r[2] for r in subset])
             fav = np.mean([r[5] == "FAVORABLE" for r in subset]) * 100
             adv = np.mean([r[5] == "ADVERSE" for r in subset]) * 100
-            print(f"{event_type:<8}| {len(subset):>4} | {fav:>9.1f}% | {adv:>7.1f}% | {avg_dir:>8.2f} | {avg_base:>13.2f} | {avg_dir-avg_base:+.2f}")
+            print(f"{event_type:<9}| {len(subset):>4} | {fav:>9.1f}% | {adv:>7.1f}% | {avg_dir:>8.2f} | {avg_base:>13.2f} | {avg_dir-avg_base:+.2f}")
 
         for node_type in ("HVN", "LVN"):
             for status in ("HIGH_ACTIVE", "MEDIUM_ACTIVE", "DEVELOPING", "LOW", "HISTORICAL"):
@@ -416,6 +465,7 @@ def main():
 
     print("\nInterpretation: positive edge means walk-forward event movement exceeded the independent non-event baseline.")
     print("No zone uses a profile window that ends after the event timestamp.")
+    print("A BREAKOUT now requires prior zone interaction; pre-existing outside price cannot create a breakout.")
     print("Acceptance remains separate from directional scoring.")
     print("This is historical validation, not a trading signal.")
 

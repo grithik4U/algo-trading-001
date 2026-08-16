@@ -1,10 +1,6 @@
 """Validate whether zone interactions have an edge versus an independent BTCUSDT baseline.
 
 Research/diagnostic only. Does not generate trade signals.
-
-The baseline is deliberately independent of the event's future path: for each
-horizon and event direction, it uses future returns from eligible non-event
-anchor bars, excluding anchors whose forward window overlaps a zone event.
 """
 
 from __future__ import annotations
@@ -66,7 +62,6 @@ def _direction(event: str, close: float, low: float, high: float) -> str | None:
 
 def _find_events(dataset, zones) -> list[Event]:
     events: list[Event] = []
-
     for z in zones:
         low, high = z["low"], z["high"]
         inside_streak = 0
@@ -86,7 +81,6 @@ def _find_events(dataset, zones) -> list[Event]:
 
             if touched:
                 last_touch_bar = i
-
                 if broken_direction is not None:
                     events.append(Event(ts, z["node_type"], low, high, z["center"], z["status"], "RETEST", broken_direction, close))
                     broken_direction = None
@@ -144,11 +138,9 @@ def _future_metrics(dataset, event: Event, horizon: int) -> tuple[float, float, 
     pos = _position(dataset, event.timestamp)
     if pos is None or pos + horizon >= len(dataset.bars) or event.direction is None:
         return None
-
     future = dataset.bars.iloc[pos + 1 : pos + horizon + 1]
     if future.empty:
         return None
-
     final_close = float(future["close"].iloc[-1])
     raw_move = final_close - event.entry
     if event.direction == "DOWN":
@@ -172,12 +164,6 @@ def _event_positions(dataset, events) -> set[int]:
 
 
 def _baseline_by_direction(dataset, events: list[Event], horizon: int) -> dict[str, float | None]:
-    """Return independent mean forward directional return for UP/DOWN.
-
-    Anchor bars are excluded when they are zone-event bars or when their forward
-    horizon overlaps any zone-event bar. This prevents the baseline from simply
-    reusing the event's own future path.
-    """
     bars = dataset.bars
     event_positions = _event_positions(dataset, events)
     blocked: set[int] = set()
@@ -186,7 +172,6 @@ def _baseline_by_direction(dataset, events: list[Event], horizon: int) -> dict[s
 
     sums = {"UP": 0.0, "DOWN": 0.0}
     counts = {"UP": 0, "DOWN": 0}
-
     for pos in range(len(bars) - horizon):
         if pos in blocked:
             continue
@@ -202,6 +187,10 @@ def _baseline_by_direction(dataset, events: list[Event], horizon: int) -> dict[s
         direction: (sums[direction] / counts[direction] if counts[direction] else None)
         for direction in ("UP", "DOWN")
     }
+
+
+def _format_baseline(value: float | None) -> str:
+    return f"{value:.2f}" if value is not None else "N/A"
 
 
 def _outcome(mfe: float, mae: float) -> str:
@@ -245,7 +234,6 @@ def main() -> None:
     start = end - timedelta(hours=4)
     provider = BinancePublicData(BinanceConfig(symbol="BTCUSDT"))
     dataset = load_aligned_binance_dataset(provider, interval="1m", start=start, end=end, bar_limit=1000)
-
     profiles = _build_profiles(dataset)
     zones = _build_zones(profiles, "HVN") + _build_zones(profiles, "LVN")
     zones.sort(key=lambda z: (z["center"], z["node_type"]))
@@ -272,7 +260,9 @@ def main() -> None:
             move, mfe, mae = metrics
             rows.append((event, move, base, mfe, mae, _outcome(mfe, mae)))
         _print_breakdown(rows, horizon)
-        print(f"baseline anchors: UP={baseline['UP']:.2f} DOWN={baseline['DOWN']:.2f}")
+        print(f"baseline anchors: UP={_format_baseline(baseline['UP'])} DOWN={_format_baseline(baseline['DOWN'])}")
+        if baseline["UP"] is None or baseline["DOWN"] is None:
+            print(f"WARNING: insufficient independent baseline anchors for {horizon}m within the current 4-hour dataset.")
 
     print("\n=== RECENT DIRECTIONAL EVENTS ===")
     print("time | type | status | zone | event | dir | entry")

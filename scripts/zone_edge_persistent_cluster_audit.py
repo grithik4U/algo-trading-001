@@ -50,6 +50,18 @@ def _event_kind(event):
     return str(event.event).upper()
 
 
+def _dataset_range(bars):
+    """Return dataset timestamps for the DataFrame returned by _load_klines."""
+    if bars.empty:
+        return None, None
+    if "timestamp" in bars.columns:
+        ts = bars["timestamp"]
+        return ts.iloc[0], ts.iloc[-1]
+    if hasattr(bars.index, "to_pydatetime"):
+        return bars.index[0], bars.index[-1]
+    return bars.index[0], bars.index[-1]
+
+
 def audit(days: int):
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - timedelta(days=days)
@@ -114,9 +126,10 @@ def audit(days: int):
     raw_counts = Counter(_event_kind(e) for e in events)
     retained_counts = Counter(_event_kind(e) for e in retained)
     cluster_counts = Counter(assignments.values())
+    dataset_start, dataset_end = _dataset_range(bars)
 
     print("=== BTCUSDT PERSISTENT CLUSTER INDEPENDENCE AUDIT ===")
-    print(f"dataset={bars[0].timestamp} -> {bars[-1].timestamp}")
+    print(f"dataset={dataset_start} -> {dataset_end}")
     print(f"raw_events={len(events)}")
     print(
         "raw_event_counts="

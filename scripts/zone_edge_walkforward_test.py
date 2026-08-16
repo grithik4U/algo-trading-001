@@ -13,6 +13,7 @@ The existing acceptance + independent-event lifecycle logic is preserved.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -35,12 +36,12 @@ from zone_edge_historical_test import (
     _future_metrics,
     _load_klines,
     _outcome,
-    _position,
 )
 
 ZONE_UPDATE_MINUTES = 60
 MIN_PROFILE_HISTORY = 8
 ZONE_MATCH_TOLERANCE = 5.0
+AUDIT_SAMPLE_SIZE = 12
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class Event:
     event: str
     direction: str | None
     entry: float
+    zone_key: str
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ class Acceptance:
     center: float
     status: str
     entry: float
+    zone_key: str
 
 
 @dataclass
@@ -74,6 +77,7 @@ class ZoneLifecycle:
     high: float
     center: float
     status: str
+    zone_key: str
     state: str = "IDLE"
     inside_streak: int = 0
     outside_up: int = 0
@@ -108,8 +112,7 @@ def _direction(event, close, low, high):
 
 
 def _zone_key(z):
-    """Stable-ish key used only for matching consecutive walk-forward snapshots."""
-    return (z["node_type"], round(float(z["center"]) / ZONE_MATCH_TOLERANCE) * ZONE_MATCH_TOLERANCE)
+    return f"{z['node_type']}:{round(float(z['center']) / ZONE_MATCH_TOLERANCE) * ZONE_MATCH_TOLERANCE:.2f}"
 
 
 def _match_states(previous, zones, snapshot_id):
@@ -136,6 +139,7 @@ def _match_states(previous, zones, snapshot_id):
             state.high = float(z["high"])
             state.center = float(z["center"])
             state.status = z["status"]
+            state.zone_key = _zone_key(z)
             state.last_seen_snapshot = snapshot_id
             result.append(state)
         else:
@@ -146,6 +150,7 @@ def _match_states(previous, zones, snapshot_id):
                     high=float(z["high"]),
                     center=float(z["center"]),
                     status=z["status"],
+                    zone_key=_zone_key(z),
                     last_seen_snapshot=snapshot_id,
                 )
             )
@@ -186,12 +191,31 @@ def _find_walk_forward_events(bars, snapshots):
     states = []
     snapshot_pointer = -1
     snapshot_id = -1
+    audit = {
+        "state_transitions": Counter(),
+        "zone_snapshots": Counter(),
+        "zone_first_seen": Counter(),
+        "event_zone_counts": Counter(),
+        "samples": [],
+    }
+
+    def transition(state, new_state, ts, reason):
+        old = state.state
+        state.state = new_state
+        audit["state_transitions"][f"{old}->{new_state}"] += 1
+        if len(audit["samples"]) < AUDIT_SAMPLE_SIZE and old != new_state:
+            audit["samples"].append((ts, state.zone_key, old, new_state, reason, state.center))
 
     for ts, row in bars.iterrows():
         snapshot_pointer, snapshot = _snapshot_for_timestamp(snapshots, ts, snapshot_pointer)
         if snapshot is not None and snapshot[2] != snapshot_id:
             snapshot_id = snapshot[2]
+            audit["zone_snapshots"][snapshot_id] += 1
+            previous_keys = {s.zone_key for s in states}
             states = _match_states(states, snapshot[1], snapshot_id)
+            for state in states:
+                if state.zone_key not in previous_keys:
+                    audit["zone_first_seen"][state.zone_key] += 1
 
         if not states:
             continue
@@ -216,8 +240,9 @@ def _find_walk_forward_events(bars, snapshots):
 
             if state.state == "BROKEN":
                 if touched:
-                    events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "RETEST", state.broken_direction, close))
-                    state.state = "COOLDOWN"
+                    events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "RETEST", state.broken_direction, close, state.zone_key))
+                    audit["event_zone_counts"][state.zone_key] += 1
+                    transition(state, "COOLDOWN", ts, "retest")
                     state.cooldown = LIFECYCLE_COOLDOWN_BARS
                     state.broken_direction = None
                 continue
@@ -237,8 +262,9 @@ def _find_walk_forward_events(bars, snapshots):
 
             if state.outside_up >= BREAKOUT_BARS or state.outside_down >= BREAKOUT_BARS:
                 direction = "UP" if state.outside_up >= BREAKOUT_BARS else "DOWN"
-                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "BREAKOUT", direction, close))
-                state.state = "BROKEN"
+                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "BREAKOUT", direction, close, state.zone_key))
+                audit["event_zone_counts"][state.zone_key] += 1
+                transition(state, "BROKEN", ts, f"breakout_{direction.lower()}")
                 state.broken_direction = direction
                 state.inside_streak = 0
                 state.bars_since_touch = None
@@ -249,36 +275,37 @@ def _find_walk_forward_events(bars, snapshots):
                 if inside:
                     state.inside_streak += 1
                     if state.inside_streak >= ACCEPTANCE_BARS and state.state != "ACCEPTED":
-                        acceptances.append(Acceptance(ts, state.node_type, state.low, state.high, state.center, state.status, close))
-                        state.state = "ACCEPTED"
+                        acceptances.append(Acceptance(ts, state.node_type, state.low, state.high, state.center, state.status, close, state.zone_key))
+                        transition(state, "ACCEPTED", ts, "acceptance_confirmed")
                 else:
                     state.inside_streak = 0
                     if state.state == "IDLE":
-                        state.state = "TOUCHED"
+                        transition(state, "TOUCHED", ts, "touch")
                 continue
 
             if state.bars_since_touch is not None:
                 state.bars_since_touch += 1
 
             if state.state in {"IDLE", "TOUCHED"} and state.bars_since_touch is not None and state.bars_since_touch <= MAX_REJECTION_BARS and (above or below):
-                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "REJECTION", _direction("REJECTION", close, state.low, state.high), close))
-                state.state = "COOLDOWN"
+                events.append(Event(ts, state.node_type, state.low, state.high, state.center, state.status, "REJECTION", _direction("REJECTION", close, state.low, state.high), close, state.zone_key))
+                audit["event_zone_counts"][state.zone_key] += 1
+                transition(state, "COOLDOWN", ts, "rejection")
                 state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 state.bars_since_touch = None
                 continue
 
             if state.state == "ACCEPTED" and (above or below):
-                state.state = "COOLDOWN"
+                transition(state, "COOLDOWN", ts, "acceptance_resolved_outside")
                 state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 state.bars_since_touch = None
                 continue
 
             if state.bars_since_touch is not None and state.bars_since_touch > MAX_REJECTION_BARS:
-                state.state = "COOLDOWN"
+                transition(state, "COOLDOWN", ts, "rejection_window_expired")
                 state.cooldown = LIFECYCLE_COOLDOWN_BARS
                 state.bars_since_touch = None
 
-    return sorted(events, key=lambda e: e.timestamp), sorted(acceptances, key=lambda a: a.timestamp)
+    return sorted(events, key=lambda e: e.timestamp), sorted(acceptances, key=lambda a: a.timestamp), audit
 
 
 def _print_summary(bars, profiles, snapshots, events, acceptances):
@@ -294,9 +321,31 @@ def _print_summary(bars, profiles, snapshots, events, acceptances):
     print(f"acceptances={len(acceptances)}")
 
 
+def _print_audit(bars, snapshots, events, acceptances, audit):
+    print("\n=== EVENT / LIFECYCLE AUDIT ===")
+    counts = Counter(e.event for e in events)
+    days = max((bars.index.max() - bars.index.min()).total_seconds() / 86400.0, 1 / 1440)
+    print(f"events_per_day={len(events) / days:.2f}")
+    print("event_counts=" + " ".join(f"{k.lower()}={counts.get(k, 0)}" for k in ("BREAKOUT", "RETEST", "SWEEP", "REJECTION")))
+    unique_event_zones = len(audit["event_zone_counts"])
+    max_events_one_zone = max(audit["event_zone_counts"].values(), default=0)
+    print(f"unique_zones_with_events={unique_event_zones}")
+    print(f"max_events_single_zone={max_events_one_zone}")
+    print(f"acceptances={len(acceptances)}")
+    print("state_transitions=" + " ".join(f"{k}={v}" for k, v in sorted(audit["state_transitions"].items())))
+    print("sample_transitions:")
+    for ts, key, old, new, reason, center in audit["samples"]:
+        print(f"  {ts} | {key} | {old}->{new} | reason={reason} | center={center:.2f}")
+    print("zone_event_frequency_top10:")
+    for key, count in audit["event_zone_counts"].most_common(10):
+        print(f"  {key} | events={count}")
+    print("audit_note=high event density or repeated events on one zone requires lifecycle review before 30d validation")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Walk-forward BTCUSDT zone edge validation")
     parser.add_argument("--days", type=int, default=7, choices=(7, 30, 90))
+    parser.add_argument("--audit", action="store_true", help="print event-density and lifecycle diagnostics")
     args = parser.parse_args()
 
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -308,9 +357,11 @@ def main():
 
     profiles = _build_profiles_from_bars(bars)
     snapshots = _build_walk_forward_snapshots(profiles)
-    events, acceptances = _find_walk_forward_events(bars, snapshots)
+    events, acceptances, audit = _find_walk_forward_events(bars, snapshots)
     acceptance_results = _acceptance_resolutions(bars, acceptances)
     _print_summary(bars, profiles, snapshots, events, acceptances)
+    if args.audit:
+        _print_audit(bars, snapshots, events, acceptances, audit)
 
     for horizon in HORIZONS:
         baseline = _baseline(bars, events, horizon)
